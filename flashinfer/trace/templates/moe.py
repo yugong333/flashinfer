@@ -2465,7 +2465,7 @@ cutlass_fused_moe_trace.axes["gemm1_out_size"] = Const(
 
 
 # ---------------------------------------------------------------------------
-# mono_moe (monomoe) — single-kernel block-FP8 top-K MoE, Qwen3.5-35B shape
+# mono_moe (monomoe) — single-kernel block-FP8 top-K MoE, E256/N512/K2048 shape
 # ---------------------------------------------------------------------------
 # Fixed-shape Hopper (SM90a) MonoMoe kernel: routing is FUSED in-kernel from
 # router_logits, so unlike cutlass_fused_moe this template takes the logits
@@ -2550,13 +2550,13 @@ def _mono_moe_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``mono_moe`` (fixed Qwen3.5-35B block-FP8 shape).
+    """Build inputs for ``mono_moe`` (E256/N512/K2048 block-FP8 shape).
 
-    The monomoe kernel is hard-specialized to E=256, N=512, K=2048, BS<=8,
-    so the defaults match that shape (``seq_len`` is the only Var, capped at
-    8 by the kernel).  Weights are block-FP8 (128×128) quantized via the
-    shared ``fp8_block_quant_2d`` helper; activations / router_logits are
-    bf16 (the kernel quantizes activations internally).
+    The defaults match that registered shape (E=256, N=512, K=2048); the
+    kernel serves up to 16 tokens (``seq_len`` is the only Var — the default
+    of 8 stays within the BS8 path).  Weights are block-FP8 (128×128)
+    quantized via the shared ``fp8_block_quant_2d`` helper; activations /
+    router_logits are bf16 (the kernel quantizes activations internally).
     """
     del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
     del num_gemm1_out_blocks
@@ -2601,9 +2601,9 @@ mono_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="mono_moe",
     description=(
-        "Single-kernel (monomoe) block-FP8 top-K MoE for the Qwen3.5-35B shape "
-        "on Hopper (SM90a). Routing (softmax/sigmoid top-K + renormalize) is "
-        "fused in-kernel from router_logits; weights are block-FP8 (128x128)."
+        "Single-kernel (monomoe) block-FP8 top-K MoE for the E256/N512/K2048 "
+        "shape on Hopper (SM90a). Routing (softmax/sigmoid top-K + renormalize) "
+        "is fused in-kernel from router_logits; weights are block-FP8 (128x128)."
     ),
     axes={
         "seq_len": Var(description="Sequence length (number of tokens, <= 8)."),

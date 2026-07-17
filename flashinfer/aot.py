@@ -537,9 +537,13 @@ def gen_all_modules(
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
-            # MonoMoe kernel: single-kernel block-FP8 top-K MoE,
-            # Hopper (SM90a) only — uses wgmma.mma_async + TMA.
-            jit_specs.append(gen_monomoe_module())
+            # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
+            # (SM90a) only (uses wgmma.mma_async + TMA).  One module per
+            # registered (E, N, K) shape from shapes.json.
+            from .fused_moe.monomoe import registered_shapes
+
+            for _e, _n, _k in registered_shapes():
+                jit_specs.append(gen_monomoe_module(_e, _n, _k))
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())

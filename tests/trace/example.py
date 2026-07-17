@@ -589,8 +589,8 @@ flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
 
-# ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
-# Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.
+# ── mono_moe / monomoe (E256/N512/K2048 block-FP8 MonoMoe kernel, SM90a) ────────
+# Registered shape: E=256, N(intermediate)=512, K(hidden)=2048, up to 16 tokens.
 # Routing is fused in-kernel from router_logits.  SM90a-only and JIT-built,
 # so wrapped in suppress(): the trace JSON dumps before the kernel launches,
 # so the definition file appears even when the kernel can't run here.

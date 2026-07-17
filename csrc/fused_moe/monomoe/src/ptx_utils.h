@@ -3,70 +3,56 @@
 
 #pragma once
 
-#include <cuda.h>  // CUtensorMap (Driver API) for the tma_load_2d signature
-
-#include <cstdint>
-#include <cute/arch/copy_sm90_desc.hpp>
-#include <cute/arch/mma_sm90.hpp>
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 namespace monomoe {
 
+// ── cp.async scalar helpers (sm_80+) ──────────────────────────────────────
+//
+// Non-blocking 4-byte global→shared copies for small latency-sensitive
+// prefetches (e.g. the per-expert block-scale tile).  Issue with
+// `cp_async_cg_4`, checkpoint with `cp_async_commit_group`, drain with
+// `cp_async_wait_group<N>()` before reading the destination.
+
+__device__ static inline void cp_async_cg_4(void* smem_dst, const void* gmem_src) {
+  const std::uint32_t smem_addr = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr), "l"(gmem_src));
+}
+
+__device__ static inline void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <std::uint32_t N>
+__device__ static inline void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+
 // ── Hopper WGMMA (sm_90a) helpers ─────────────────────────────────────────
 //
-// These thin wrappers expose the `wgmma.mma_async` family of instructions
-// for fp8 (e4m3) operands with fp32 accumulators.
+// Wrappers for `wgmma.mma_async` with fp8 (e4m3) operands and fp32
+// accumulators.  Key semantics vs `mma.sync`:
 //
-// WGMMA semantics (key differences from `mma.sync`):
+//   * Issued by a full warpgroup (4 warps); every thread must execute it.
+//   * A and B live in shared memory, addressed by 64-bit matrix
+//     descriptors (base address + leading/stride byte offsets + swizzle).
+//   * The accumulator D stays in registers, distributed across the WG.
+//   * Asynchronous: `commit_group` checkpoints, `wait_group<N>` waits for
+//     all but the last N groups, and `wgmma_fence` orders prior register
+//     writes before the SHM reads of subsequent WGMMAs.
 //
-//   * Issued by a full **warpgroup** (4 consecutive warps = 128 threads).
-//     Every thread in the warpgroup must execute the instruction.
-//
-//   * A and B operands live in **shared memory**, addressed by 64-bit
-//     "matrix descriptors" that encode base address, leading- and stride-
-//     dimension byte offsets, and a swizzle mode.  We use SWIZZLE_NONE for
-//     correctness-first bring-up; upgrade to 128B swizzle later for perf.
-//
-//   * The accumulator D is kept in **registers**, distributed across the
-//     warpgroup.  For `m64n8k32` each thread holds 4 fp32 values; for
-//     larger N, more.
-//
-//   * WGMMA is **asynchronous**.  After issuing one or more WGMMAs you
-//     must `wgmma.commit_group.sync` to checkpoint, and
-//     `wgmma.wait_group.sync N` to wait for all but the last N groups
-//     to finish.  Before loading new operands into SHM slots that a
-//     pending WGMMA reads, use `wgmma.fence.sync.aligned` to establish
-//     ordering between register writes and the SHM reads.
-//
-// References:
-//   - PTX ISA 8.5 §9.7.15 "Asynchronous Warpgroup Level Matrix Multiply-
-//     Accumulate Instructions"
-//   - NVIDIA Hopper H100 architecture whitepaper
+// Reference: PTX ISA §9.7.15 (Asynchronous Warpgroup MMA).
 
 /**
  * @brief Build a WGMMA 64-bit shared-memory matrix descriptor.
  *
- * Layout (bit ranges, LSB first):
- *   [13: 0]  start address                 : (addr >> 4) & 0x3FFF
- *   [15:14]  reserved                      : 0
- *   [29:16]  leading-dim byte offset (LBO) : (lbo  >> 4) & 0x3FFF
- *   [31:30]  reserved                      : 0
- *   [45:32]  stride-dim byte offset (SBO)  : (sbo  >> 4) & 0x3FFF
- *   [48:46]  reserved                      : 0
- *   [50:49]  base offset (unused here, 0)  : 0
- *   [51:52]  reserved
- *   [52:52]  LBO mode (unused for SWZ_NONE): 0
- *   [62:53]  reserved
- *   [63:62]  swizzle mode                  : 0=none, 1=128B, 2=64B, 3=32B
- *
- * For SWIZZLE_NONE with a canonical K-major layout:
- *   - `addr` is the SHM byte address of the (0,0) element of the tile.
- *   - `lbo` is the byte offset between consecutive "core matrices" along
- *     the leading dimension.  A core matrix is 8 rows × 16 bytes (for
- *     e4m3 k=32 that's 8×16 = 128 B per 8-row strip in K).
- *   - `sbo` is the byte offset between consecutive core matrices along
- *     the stride dimension (same 128 B for k=32, 8-row tiling).
- *
- * The shifts-by-4 reflect the 16-byte alignment requirement on all three.
+ * Bit layout (LSB first): [13:0] addr>>4, [29:16] LBO>>4, [45:32] SBO>>4,
+ * [63:62] swizzle mode (0=none, 1=128B, 2=64B, 3=32B).  LBO is the byte
+ * offset between consecutive 8-row × 16-byte core matrices along the
+ * leading dimension; SBO along the stride dimension.  All three must be
+ * 16-byte aligned (hence the >>4).
  */
 __device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr,
                                                                 std::uint64_t leading_byte_offset,
@@ -85,66 +71,53 @@ __device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr
   return desc;
 }
 
-/**
- * @brief WGMMA fence — order prior register writes before SHM reads by
- *        subsequent WGMMA instructions in the same warpgroup.
- *
- * Required between register-based accumulator zeroing and the first
- * WGMMA in a group.  Not needed between back-to-back WGMMAs that chain
- * accumulators.
- */
-__device__ static __forceinline__ void wgmma_fence() { cute::warpgroup_arrive(); }
+/** Order prior register writes before SHM reads by subsequent WGMMAs. */
+__device__ static __forceinline__ void wgmma_fence() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
 
-/**
- * @brief Close the currently-outstanding WGMMA group and start a new one.
- */
-__device__ static __forceinline__ void wgmma_commit_group() { cute::warpgroup_commit_batch(); }
-
-/**
- * @brief Wait until at most N WGMMA groups are still outstanding.
- *        `wgmma_wait_group<0>()` waits for all pending groups.
- */
-template <std::uint32_t N>
-__device__ __forceinline__ void wgmma_wait_group() {
-  cute::warpgroup_wait<static_cast<int>(N)>();
+/** Close the currently-outstanding WGMMA group. */
+__device__ static __forceinline__ void wgmma_commit_group() {
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
 /**
- * @brief wgmma.mma_async m64n8k32 fp8×fp8 → fp32 with SHM A and SHM B.
+ * @brief Wait until at most N WGMMA groups are still outstanding.
  *
- * Accumulator layout (per thread in the warpgroup, for N=8):
- *   d[0..3] — 4 fp32 values.  Thread (lane l, warp w in {0..3}) in the
- *   warpgroup owns:
- *     d[0]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 0
- *     d[1]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 1
- *     d[2]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 0
- *     d[3]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 1
- *   (Same mapping as mma.sync m16n8k32, replicated 4× across the warps.)
+ * N must be a PTX integer literal, hence explicit specializations.
+ */
+template <std::uint32_t N>
+__device__ __forceinline__ void wgmma_wait_group();
+
+template <>
+__device__ __forceinline__ void wgmma_wait_group<0>() {
+  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+}
+template <>
+__device__ __forceinline__ void wgmma_wait_group<1>() {
+  asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+}
+template <>
+__device__ __forceinline__ void wgmma_wait_group<2>() {
+  asm volatile("wgmma.wait_group.sync.aligned 2;\n" ::: "memory");
+}
+
+/**
+ * @brief wgmma.mma_async m64n8k32 fp8×fp8 → fp32, SHM A and SHM B.
  *
- * PTX form (from CUTLASS mma_sm90_gmma.hpp, MMA_64x8x32_F32E4M3E4M3_SS_TN):
- *   {
- *     .reg .pred p;
- *     setp.ne.b32 p, <scale_D_reg>, 0;
- *     wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3
- *         {d0, d1, d2, d3}, desc_a, desc_b, p, <scaleA>, <scaleB>;
- *   }
- *   where scaleA / scaleB are immediates (+1 or -1).
+ * Accumulator layout per thread (lane l, warp w in the WG), same mapping as
+ * mma.sync m16n8k32 replicated 4× across the warps:
+ *   d[0]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 0
+ *   d[1]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 1
+ *   d[2]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 0
+ *   d[3]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 1
  *
- * This wrapper hard-codes:
- *   scale_D = 1  (accumulate: D = A·B + D)
- *   scaleA  = 1, scaleB = 1
- * which are the only modes our kernel uses.
- *
- * @param desc_a   Matrix descriptor for operand A (weights, M×K)
- * @param desc_b   Matrix descriptor for operand B (activations, K×N)
- * @param d0..d3   4 fp32 accumulator registers (read-modify-write)
+ * Hard-codes scale_D = 1 (accumulate) and scaleA = scaleB = +1.
  */
 __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(std::uint64_t desc_a,
                                                                     std::uint64_t desc_b, float& d0,
                                                                     float& d1, float& d2,
                                                                     float& d3) {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  // scale_D = 1 → accumulate into d0..d3.
   constexpr std::uint32_t scale_D = 1;
   asm volatile(
       "{\n"
@@ -155,58 +128,61 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(std::uint64_
       "}\n"
       : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
       : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
-#else
-  (void)desc_a;
-  (void)desc_b;
-  (void)d0;
-  (void)d1;
-  (void)d2;
-  (void)d3;
-  asm volatile("trap;");
-#endif
 }
 
-__device__ inline std::uint32_t rotate_col_32(std::uint32_t col, std::uint32_t row) {
-  std::uint32_t col_base = col & 0xff9f;
-  std::uint32_t col_rot = (col + 0x20 * row) & 0x60;
-  return col_base | col_rot;
+/**
+ * @brief wgmma.mma_async m64n16k32 fp8×fp8 → fp32, SHM A and SHM B.
+ *
+ * BS16 up/down-projection shape: one instruction consumes all 16 token
+ * columns per K-substep instead of two stacked m64n8k32 issues.
+ *
+ * Accumulator layout (per thread in the warpgroup, for N=16):
+ *   d[0..7] — 8 fp32 values.  The mapping is the m64n8k32 fragment
+ *   replicated for the second 8-column quadrant (N=[8,16)):
+ *     d[0]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 0
+ *     d[1]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 1
+ *     d[2]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 0
+ *     d[3]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 1
+ *     d[4]: row = w*16 + l/4 + 0,  col = 8 + (l%4)*2 + 0
+ *     d[5]: row = w*16 + l/4 + 0,  col = 8 + (l%4)*2 + 1
+ *     d[6]: row = w*16 + l/4 + 8,  col = 8 + (l%4)*2 + 0
+ *     d[7]: row = w*16 + l/4 + 8,  col = 8 + (l%4)*2 + 1
+ *   (64 M rows × 16 N columns / 128 lanes = 8 fp32 elements per lane.)
+ *
+ * Hard-codes scale_D = 1 (accumulate) and scaleA = scaleB = +1, matching
+ * wgmma_m64n8k32_e4m3_e4m3_f32 — the only modes this kernel uses.
+ */
+__device__ static __forceinline__ void wgmma_m64n16k32_e4m3_e4m3_f32(
+    std::uint64_t desc_a, std::uint64_t desc_b, float& d0, float& d1, float& d2, float& d3,
+    float& d4, float& d5, float& d6, float& d7) {
+  constexpr std::uint32_t scale_D = 1;
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %10, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, p, %11, %12;\n"
+      "}\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3), "+f"(d4), "+f"(d5), "+f"(d6), "+f"(d7)
+      : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
 }
 
 // ── Hopper mbarrier helpers (sm_90a) ──────────────────────────────────────
 //
-// Thin PTX wrappers around the `mbarrier.*` family used to gate TMA
-// (`cp.async.bulk.tensor.*`) transfers. An mbarrier is a 64-bit shared-
-// memory object (16-byte aligned) with two internal counters:
+// Wrappers around the `mbarrier.*` family used to gate TMA transfers.  An
+// mbarrier is a 64-bit, 16-byte-aligned SHM object with two counters:
 //
-//   1. Arrival counter   — decremented by `mbarrier.arrive*`.
-//                          Initialized by `mbarrier.init` to `arrival_count`.
-//   2. Transaction-bytes — decremented by the TMA engine as bytes land in
-//                          SMEM. Initialized to 0, then *set* by
-//                          `mbarrier.arrive.expect_tx` (or `expect_tx`).
+//   1. Arrival counter   — set by `mbarrier.init`, decremented by arrives.
+//   2. Transaction bytes — set by `arrive.expect_tx`, decremented by the
+//      TMA engine as bytes land in SHM.
 //
-// The barrier "completes" (flips its parity bit) when both counters reach
-// zero. Consumers spin on `mbarrier.try_wait.parity` with a self-cycling
-// parity register, avoiding explicit reset between uses.
+// The barrier completes (flips its parity bit) when both reach zero.
+// Consumers spin on `try_wait.parity` with a self-cycling parity register,
+// so no explicit reset is needed between uses.
 //
-// All of these instructions require SM90+; the bodies are compiled out on
-// older targets to avoid emitting invalid PTX (`ptxas` would otherwise
-// reject them).
-//
-// References:
-//   - PTX ISA 8.5 §9.7.12 "Parallel Synchronization Instructions:
-//     mbarrier"
-//   - CUDA Hopper Tuning Guide §1.4.1.2 "Asynchronous Memory Copy with
-//     mbarrier"
+// Reference: PTX ISA §9.7.12; CUDA Hopper Tuning Guide §1.4.1.2.
 
-/**
- * @brief Convert a generic SHM pointer to a 32-bit shared state-space
- *        address via `cvta.to.shared.u64`.
- *
- * PTX shared-memory operands are 32-bit addresses within the shared
- * state space. We issue `cvta.to.shared.u64` for consistency with
- * `make_wgmma_desc` above and then truncate to 32 bits — the upper
- * bits of a shared pointer are always zero on SM90.
- */
+/** Convert a generic SHM pointer to a 32-bit shared state-space address. */
 __device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(const void* ptr) {
   std::uint64_t shm_u64;
   asm volatile("cvta.to.shared.u64 %0, %1;\n"
@@ -218,31 +194,23 @@ __device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(const void* p
 /**
  * @brief Initialize an mbarrier in SHM.
  *
- * Sets the arrival counter to `arrival_count` and the transaction-bytes
- * counter to 0. Must be called exactly once per barrier before any
- * arrive / wait, and must be followed by a release fence
- * (`fence.mbarrier_init.release.cluster`) before any remote arrival
- * or TMA issue targeting this barrier.
- *
- * @param bar            16-B aligned pointer to the barrier in SHM.
- * @param arrival_count  Expected number of `mbarrier.arrive*` calls
- *                       (typically 1 for TMA-only completion).
+ * Must run exactly once per barrier before any arrive/wait, and must be
+ * followed by `fence_mbarrier_init_release_cluster()` before any remote
+ * arrival or TMA issue targeting the barrier.
  */
 __device__ static __forceinline__ void mbarrier_init(std::uint64_t* bar,
                                                      std::uint32_t arrival_count) {
-  cute::initialize_barrier(*bar, static_cast<int>(arrival_count));
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_addr), "r"(arrival_count));
+#else
+  (void)bar;
+  (void)arrival_count;
+  asm volatile("trap;");
+#endif
 }
 
-/**
- * @brief Publish prior `mbarrier.init` writes so that cluster-visible
- *        arrivals (including TMA-engine completions) observe them.
- *
- * Emits: `fence.mbarrier_init.release.cluster;`
- *
- * Required after the last `mbarrier.init` on a block's set of barriers
- * and before the first `mbarrier.arrive*` or `cp.async.bulk.tensor.*`
- * that targets any of them.
- */
+/** Publish prior `mbarrier.init` writes to cluster-visible arrivals. */
 __device__ static __forceinline__ void fence_mbarrier_init_release_cluster() {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -254,46 +222,55 @@ __device__ static __forceinline__ void fence_mbarrier_init_release_cluster() {
 /**
  * @brief Arrive on an mbarrier and set its transaction-bytes counter.
  *
- * Combined arrive + expect_tx operation:
- *   - Decrements the arrival counter by 1.
- *   - Adds `tx_bytes` to the transaction-bytes counter.
- *
- * Consumers synchronize via `mbarrier_try_wait_parity`.  Callers must issue
- * the TMA (`cp.async.bulk.tensor.*`) targeting this same barrier *after* this
- * call so the hardware-emitted `complete_tx` decrements the counter we just
- * primed.
- *
- * @param bar       16-B aligned pointer to the barrier in SHM.
- * @param tx_bytes  Expected total bytes the TMA engine will deliver.
+ * The caller must issue the TMA(s) targeting this barrier AFTER this call;
+ * `tx_bytes` must cover the total bytes of every TMA pointing at it.
  */
 __device__ static __forceinline__ void mbarrier_arrive_expect_tx(std::uint64_t* bar,
                                                                  std::uint32_t tx_bytes) {
-  cute::set_barrier_transaction_bytes(*bar, tx_bytes);
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
+  [[maybe_unused]] std::uint64_t state;
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 %0, [%1], %2;\n"
+               : "=l"(state)
+               : "r"(bar_addr), "r"(tx_bytes)
+               : "memory");
+#else
+  (void)bar;
+  (void)tx_bytes;
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Plain arrive on an mbarrier (no transaction bytes).
+ *
+ * Consumer-side "slot empty" signal for producer/consumer pipelines: each
+ * consuming warp arrives once per phase after its last read of the guarded
+ * buffer; the producer waits the phase via mbarrier_try_wait_parity before
+ * overwriting.  The arrive carries release semantics for the consumer's
+ * prior SHM reads.
+ */
+__device__ static __forceinline__ void mbarrier_arrive(std::uint64_t* bar) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
+  [[maybe_unused]] std::uint64_t state;
+  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];\n"
+               : "=l"(state)
+               : "r"(bar_addr)
+               : "memory");
+#else
+  (void)bar;
+  asm volatile("trap;");
+#endif
 }
 
 /**
  * @brief Non-blocking parity-based wait on an mbarrier.
  *
- * Emits:
- *   {
- *     .reg .pred P;
- *     mbarrier.try_wait.parity.shared::cta.b64 P, [bar], parity;
- *     selp.u32 out, 1, 0, P;
- *   }
- *
- * Returns true iff the barrier's current parity matches `parity`,
- * i.e. the barrier has completed for the expected phase. Callers
- * typically loop:
- *
+ * Returns true iff the barrier completed for the expected phase.  Typical
+ * use:
  *   while (!mbarrier_try_wait_parity(bar, parity)) {}
- *   parity ^= 1;  // flip for next use of the same slot
- *
- * The barrier is self-cycling — no reset is needed between uses;
- * each completion toggles the internal parity bit.
- *
- * @param bar     16-B aligned pointer to the barrier in SHM.
- * @param parity  Expected parity bit (0 or 1).
- * @return  `true` if the barrier has reached the expected phase.
+ *   parity ^= 1;  // flip for the next use of the same slot
  */
 __device__ static __forceinline__ bool mbarrier_try_wait_parity(std::uint64_t* bar,
                                                                 std::uint32_t parity) {
@@ -319,61 +296,21 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(std::uint64_t* b
 }
 
 // ── Hopper TMA bulk-tensor copy (sm_90a) ──────────────────────────────────
-//
-// Thin PTX wrapper around `cp.async.bulk.tensor.2d.shared::cluster.global.tile.
-// mbarrier::complete_tx::bytes`. The TMA engine reads a rectangular tile
-// from a tensor in global memory (described by a host-built `CUtensorMap`)
-// and writes it into shared memory, decrementing the transaction-bytes
-// counter of the supplied mbarrier as bytes land.
-//
-// Caller contract:
-//   - Issued by exactly one thread in the block (the "TMA launcher").
-//   - `desc` is a `__grid_constant__ CUtensorMap const` kernel parameter,
-//     or otherwise lives in memory coherent with every thread. Passing a
-//     generic C++ reference keeps the source readable; the PTX operand
-//     is its address, fetched via `&desc`. Parameter-space addresses are
-//     coherent with all threads on SM90+, so no `cvta.param.u64` is
-//     required — the driver-supplied descriptor address is already usable
-//     as a 64-bit global-coherent pointer (this matches the usage pattern
-//     in CUTLASS SM90 TMA helpers and in `gpt_oss_router_gemm.cuh`).
-//   - The caller must pre-arm `bar_smem` once with
-//     `mbarrier_arrive_expect_tx(bar_smem, tx_bytes)` where `tx_bytes`
-//     covers every TMA issue pointing at this same barrier, before
-//     calling this function. The hardware `complete_tx` emitted by each
-//     TMA decrements that counter.
-//
-// Coordinate convention matches `cuTensorMapEncodeTiled`:
-//   - `coord0` is along the innermost (fastest) global axis.
-//   - `coord1` is along the outer axis.
-// For our use cases both descriptors have innermost = K, so `coord0 =
-// k_start`.
-//
-// References:
-//   - PTX ISA §9.7.8.24 "cp.async.bulk.tensor"
-//   - CUDA Hopper Tuning Guide §1.4.1.2
-//   - CUTLASS `include/cute/arch/copy_sm90_tma.hpp`
 
 /**
  * @brief Issue one 2D TMA bulk-tensor load, tracked by an mbarrier.
  *
- * Emits:
- *   `cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes`
- *   `  [dst_smem_addr], [desc, {coord0, coord1}], [bar_smem_addr];`
+ * The TMA engine copies one `boxDim` tile of the tensor described by
+ * `desc` (a `__grid_constant__ CUtensorMap` kernel parameter — parameter
+ * space is coherent with all threads on SM90+) into SHM, decrementing the
+ * barrier's transaction-bytes counter as bytes land.  Returns immediately.
  *
- * The instruction returns immediately; the TMA engine performs the copy
- * asynchronously and signals completion on `bar_smem` via the
- * transaction-bytes mechanism. Consumers wait via
- * `mbarrier_try_wait_parity`.
- *
- * Byte count per issue is determined by the descriptor's `boxDim` and
- * element type, NOT by this wrapper — it is the caller's responsibility
- * to sum all issues' byte counts into `tx_bytes` when arming the barrier.
- *
- * @param desc      `__grid_constant__` 2D tensor descriptor.
- * @param coord0    Tile coordinate along the innermost global axis.
- * @param coord1    Tile coordinate along the outer global axis.
- * @param dst_smem  16-B aligned SHM destination pointer.
- * @param bar_smem  16-B aligned SHM barrier (pre-armed with `expect_tx`).
+ * Caller contract:
+ *   - Issued by exactly one thread in the block (the TMA launcher).
+ *   - `bar_smem` must be pre-armed with `mbarrier_arrive_expect_tx`
+ *     covering the total byte count of every TMA issue targeting it.
+ *   - Coordinate order matches `cuTensorMapEncodeTiled`: coord0 = innermost
+ *     (fastest) global axis, coord1 = outer axis.
  */
 __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std::uint32_t coord0,
                                                    std::uint32_t coord1, void* dst_smem,
@@ -382,11 +319,8 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std:
   std::uint32_t dst_addr = cvta_to_shared_u32(dst_smem);
   std::uint32_t bar_addr = cvta_to_shared_u32(bar_smem);
   std::uint64_t desc_addr = reinterpret_cast<std::uint64_t>(&desc);
-  // `.shared::cluster` dst (not `.shared::cta`, which needs PTX ISA 8.6 /
-  // CUDA 12.8+ and fails on older ptxas).  Equivalent for a non-cluster
-  // launch; same form CUTLASS emits in cute/arch/copy_sm90_tma.hpp.
   asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+      "cp.async.bulk.tensor.2d.shared::cta.global.tile"
       ".mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];\n"
       :

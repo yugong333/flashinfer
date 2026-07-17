@@ -1,0 +1,142 @@
+{
+  "_comment": "Single source of truth for monokernel shapes. Each entry declares ONE compile-time specialization (the kernel is template-specialized on N/K/E, so a new shape needs a rebuild). The generator csrc/fused_moe/monomoe/tools/gen_shapes.py reads this and emits the C++ Dims structs (dims_generated.inc). Shape-keyed names are E{E}_N{N}_K{K} and carry no model name. config[0] MUST be the shipped default (its knobs define the base Dims). UP_COL_HALVES is normally DERIVED from DCT: uch = max(1, 2*N*DCT/(128*K)); uch>=2 => raw two-TMA up-proj (no Python interleave). A shape MAY instead pin UP_COL_HALVES explicitly (optional per-shape 'up_col_halves' field) to DECOUPLE the up grid from the down grid when the coupling identity has no integer solution (UP_GROUPS != DOWN_GROUPS); such shapes use the expert-slot producer->consumer split at site #2 and are all-raw (never interleaved). top_k is a RUNTIME arg (1..8); the value here is only the tuner/serving default.",
+  "atom": 128,
+  "constraints": {
+    "E_multiple_of": 32,
+    "max_token_expert_pairs": 64,
+    "N_multiple_of": 128,
+    "K_multiple_of": 128,
+    "top_k_max": 8
+  },
+  "shapes": [
+    {
+      "key": "e256_n512_k2048",
+      "aliases": [],
+      "display_name": "E256 N512 K2048 block-wise FP8",
+      "E": 256,
+      "N": 512,
+      "K": 2048,
+      "bs16": true,
+      "bs16_config_ids": [0, 1, 2, 3, 6, 7],
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave); DCT=512 exceeds the BS16 SHM budget, so this config is BS8-only"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128; DCT=512 exceeds the BS16 SHM budget, so this config is BS8-only"},
+        {"id": 6, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2, "uch": 2, "note": "BS16-safe decoupled/raw candidate: UCH=2 with DCT=256 to stay within SHM budget"},
+        {"id": 7, "grid": 128, "dct": 256, "kup": 256, "kdn": 128, "slots": 4, "dpd": 4, "note": "config-0 up side + 4-deep down TMA ring (KDN=128, DPD=4): 2 K-steps of down lookahead to keep DRAM busy through the per-expert epilogue"}
+      ]
+    },
+    {
+      "key": "e256_n1024_k3072",
+      "aliases": [],
+      "display_name": "E256 N1024 K3072 block-wise FP8",
+      "E": 256,
+      "N": 1024,
+      "K": 3072,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (KUP=256, 188KB); fastest on H200 BS8 M=1..8"},
+        {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "former default (KUP=128)"},
+        {"id": 2, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 4, "note": "SLOTS=4 (188KB)"}
+      ]
+    },
+    {
+      "_comment": "DECOUPLED up/down carve. K=6144, N_half=256 has no coupled solution (the identity 2N/(128*UCH)=K/DCT forces DOWN_COL_TILE=1536 => 12 halves / ~384KB SHM). Pin UP_COL_HALVES=2 explicitly (raw two-TMA up-proj, NO Python interleave) so the up grid (UP_GRID=2*N/(128*UCH)=2, UP_GROUPS=64) is chosen independently of the down grid (DOWN_GRID=K/DCT=16, DOWN_GROUPS=8). Barrier ratio R=UP_GROUPS/DOWN_GROUPS=8; site #2 uses the expert-slot producer->consumer split (expert_produce_arrive / expert_consume_wait) instead of the coupled per-up_group expert_barrier. down-proj reduction dim is N=256 (K_TILES_DOWN = 256/KDN). All configs are raw (UCH>=2) so Python never interleaves w13.",
+      "key": "e256_n256_k6144",
+      "aliases": ["n256k6144"],
+      "display_name": "E256 N256 K6144 decoupled block-wise FP8",
+      "E": 256,
+      "N": 256,
+      "K": 6144,
+      "up_col_halves": 2,
+      "default_top_k": 8,
+      "scoring_func": "sigmoid",
+      "use_expert_bias": true,
+      "routed_scaling_factor": 2.5,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (tuned 2026-07-02, H200 synthetic sweep: best at every M 1/2/4/8, 1.19x/1.19x/1.14x/1.05x vs Triton); UCH=2 raw, UP_GRID=2/UP_GROUPS=64, DOWN_GRID=16/DOWN_GROUPS=8, R=8; KUP=256 => 24 up K-steps; SHM~219KB"},
+        {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "KUP=128 (48 up K-steps); lowest SHM ~187KB; former default"},
+        {"id": 2, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 4, "note": "SLOTS=4 deeper up-weight lookahead; SHM~219KB"},
+        {"id": 3, "grid": 112, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "grid=112 partial (DOWN 16x7, UP_GROUPS=56); loses at M=8 (0.84x)"},
+        {"id": 4, "grid": 120, "dct": 256, "kup": 256, "kdn": 128, "slots": 2, "note": "DCT=256: DOWN 24x5, UP_GROUPS=60; runner-up at M=1"},
+        {"id": 5, "grid": 96, "dct": 128, "kup": 256, "kdn": 128, "slots": 2, "note": "DCT=128: DOWN 48x2, UP_GROUPS=48; loses badly at M>=4"}
+      ]
+    },
+    {
+      "_comment": "E-sweep shapes: N=512, K=2048 with varying expert count to exercise the generic E axis. Same config set as e256_n512_k2048 (DCT 256 interleave cfg0-3, DCT 512 raw cfg4-5).",
+      "key": "e64_n512_k2048",
+      "aliases": ["e64"],
+      "display_name": "E64 N512 K2048 block-wise FP8",
+      "E": 64,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "key": "e128_n512_k2048",
+      "aliases": ["e128"],
+      "display_name": "E128 N512 K2048 block-wise FP8",
+      "E": 128,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "key": "e512_n512_k2048",
+      "aliases": ["e512"],
+      "display_name": "E512 N512 K2048 block-wise FP8",
+      "E": 512,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "_comment": "Candidate configs from enum_configs; config 0 is the heuristic default — retune with tune_monomoe.py. Sigmoid scoring + expert bias (noaux_tc-style routing).",
+      "key": "e256_n768_k3072",
+      "aliases": [],
+      "display_name": "E256 N768 K3072 block-wise FP8",
+      "E": 256,
+      "N": 768,
+      "K": 3072,
+      "default_top_k": 8,
+      "scoring_func": "sigmoid",
+      "use_expert_bias": true,
+      "configs": [
+        {"id": 0, "grid": 132, "dct": 256, "kup": 256, "kdn": 128, "slots": 2, "note": "heuristic default (untuned)"},
+        {"id": 1, "grid": 132, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~168KB"},
+        {"id": 2, "grid": 132, "dct": 256, "kup": 256, "kdn": 128, "slots": 4, "note": "coupled candidate, SHM~168KB"},
+        {"id": 3, "grid": 132, "dct": 256, "kup": 128, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~104KB"},
+        {"id": 4, "grid": 132, "dct": 256, "kup": 384, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~136KB"},
+        {"id": 5, "grid": 132, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~168KB"}
+      ]
+    }
+  ]
+}

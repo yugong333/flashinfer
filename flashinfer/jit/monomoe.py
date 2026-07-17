@@ -45,9 +45,14 @@ def _get_monomoe_csrc_dir() -> Path:
     )
 
 
-def get_monomoe_uri() -> str:
-    """Generate the unique identifier for the monomoe module."""
-    return "monomoe"
+def get_monomoe_uri(E: int, N: int, K: int) -> str:
+    """Unique identifier for a monomoe module, keyed on the (E, N, K) shape.
+
+    One module is JIT-compiled per registered shape (each bakes ALL of that
+    shape's tunable configs, dispatched at runtime by ``config_id``), so the
+    URI — and hence the build dir and cached ``.so`` — must be shape-specific.
+    """
+    return f"monomoe_E{E}_N{N}_K{K}"
 
 
 # Files actually fed to nvcc as compilation units.  Everything else in the
@@ -74,27 +79,37 @@ _INCLUDE_FILES = [
     "src/moe_scale_inputs.cuh",
     "src/moe_interface.h",
     "src/moe_internal.h",
-    "src/moe_grid_barrier.h",
     "src/moe_tma.h",
     "src/ptx_utils.h",
+    "generated/dims_generated.inc",
+    "generated/configs_generated.inc",
 ]
 
 
 @functools.cache
-def gen_monomoe_module():
+def gen_monomoe_module(E: int, N: int, K: int):
     """
-    Generate the JIT compilation spec for the MonoMoe kernel.
+    Generate the JIT compilation spec for one MonoMoe shape.
 
     Compiles the single-kernel top-K MoE pipeline (routing, up-projection,
-    SiLU, down-projection, reduction) for the Qwen3.5-35B block-FP8
-    WGMMA+TMA path.  Hopper (SM90a) only — the kernel uses
-    `wgmma.mma_async` and TMA, which require SM90.
+    SiLU, down-projection, reduction) for the block-FP8 WGMMA+TMA path,
+    specialized to the ``(E, N, K)`` shape.  The module bakes ALL of that
+    shape's tunable configs (from ``configs_generated.inc``) and dispatches on
+    a runtime ``config_id``; the ``-DMONOMOE_SHAPE_E{E}_N{N}_K{K}`` define
+    selects which shape's blocks compile, so only this shape's kernels are
+    instantiated.  Hopper (SM90a) only — the kernel uses `wgmma.mma_async` and
+    TMA, which require SM90.
+
+    Args:
+        E: number of experts.
+        N: intermediate size per half (gate/up each have N rows; 2*N total).
+        K: hidden size.
 
     Returns:
         JitSpec that can be built and loaded.
     """
     csrc_dir = _get_monomoe_csrc_dir()
-    uri = get_monomoe_uri()
+    uri = get_monomoe_uri(E, N, K)
 
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     # `src/` must exist so the `#include "src/..."` paths resolve and so the
@@ -130,6 +145,9 @@ def gen_monomoe_module():
         + [
             "-DFLASHINFER_ENABLE_BF16",
             "-DFLASHINFER_ENABLE_FP8_E4M3",
+            # Selects the active shape in configs_generated.inc so only this
+            # shape's DimsTunable configs instantiate (bounded compile).
+            f"-DMONOMOE_SHAPE_E{E}_N{N}_K{K}",
         ],
         extra_include_paths=[
             str(gen_directory),
@@ -147,14 +165,15 @@ def gen_monomoe_module():
 
 
 @functools.cache
-def load_monomoe_module():
+def load_monomoe_module(E: int, N: int, K: int):
     """
-    Build and load the MonoMoe kernel CUDA extension via
+    Build and load the MonoMoe CUDA extension for one ``(E, N, K)`` shape via
     FlashInfer's JIT system.
 
-    Returns the loaded module exposing `monomoe_topk`.
+    Returns the loaded module exposing `monomoe_topk`,
+    `monomoe_scratchpad_size`, and `monomoe_scratchpad_size_max`.
     """
-    spec = gen_monomoe_module()
+    spec = gen_monomoe_module(E, N, K)
     module = spec.build_and_load()
-    logger.info("monomoe module loaded successfully")
+    logger.info(f"monomoe module loaded successfully (E={E}, N={N}, K={K})")
     return module
